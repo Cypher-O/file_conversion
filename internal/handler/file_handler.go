@@ -19,13 +19,16 @@ func ConvertFileHandler(c *gin.Context) {
 	targetFormat := c.DefaultQuery("format", "pdf")
 
 	// Call the service layer to handle file conversion
-	convertedFile, err := service.ConvertFile(file, targetFormat)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Conversion failed: %s", err.Error())})
+	resp := service.ConvertFile(file, targetFormat)
+
+	// Check if there is an error in the response (code != 0 means failure)
+	if resp.Code != 0 {
+		// Return an error response with the message from APIResponse
+		c.JSON(http.StatusInternalServerError, resp)
 		return
 	}
 
 	// Send the converted file as the response
-	c.Header("Content-Disposition", "attachment; filename=converted_file."+targetFormat)
-	c.Data(http.StatusOK, "application/octet-stream", convertedFile)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=converted_file.%s", targetFormat))
+	c.Data(http.StatusOK, "application/octet-stream", resp.Data.([]byte))
 }
