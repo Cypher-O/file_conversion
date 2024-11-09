@@ -2,64 +2,80 @@ package service
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
-	"io"
-	"synth.com/file_converter/internal/response"
-	"synth.com/file_converter/internal/utils"
-	"github.com/nfnt/resize"
-	"github.com/signintech/gopdf"
 	"image"
 	"image/jpeg"
 	"image/png"
-	"github.com/chai2010/webp" // WebP support
+	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/chai2010/webp"
+	"github.com/nfnt/resize"
+	"github.com/signintech/gopdf"
+	"github.com/xuri/excelize/v2"
+	"synth.com/file_converter/internal/response"
+	"synth.com/file_converter/internal/utils"
 )
 
-// ConvertFile handles the logic to convert the file based on target format.
-func ConvertFile(file io.Reader, targetFormat string) response.APIResponse {
-	validFormats := []string{"pdf", "jpg", "png", "webp"}
+// ConvertFile handles the logic to convert the file based on target format
+func ConvertFile(file io.Reader, filename, targetFormat string) response.APIResponse {
+	validFormats := []string{"pdf", "jpg", "png", "webp", "csv"}
 	if !utils.Contains(validFormats, targetFormat) {
-		// Return error response if the target format is invalid
 		return response.NewErrorResponse(400, "Invalid target format")
 	}
 
-	// Convert the file based on the target format
-	if targetFormat == "webp" || targetFormat == "png" || targetFormat == "jpg" {
+	// Determine the file extension
+	ext := filepath.Ext(filename)
+
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".webp":
 		data, err := ConvertImage(file, targetFormat)
 		if err != nil {
-			// Log the error for debugging purposes
 			return response.NewErrorResponse(500, fmt.Sprintf("Image conversion failed: %s", err.Error()))
 		}
 		return response.NewSuccessResponse("Image converted successfully", data)
-	}
 
-	if targetFormat == "pdf" {
-		data, err := ConvertToPDF(file)
+	case ".docx":
+		data, err := ConvertWordToPDF(file)
 		if err != nil {
-			// Log the error for debugging purposes
-			return response.NewErrorResponse(500, fmt.Sprintf("PDF conversion failed: %s", err.Error()))
+			return response.NewErrorResponse(500, fmt.Sprintf("Word to PDF conversion failed: %s", err.Error()))
 		}
-		return response.NewSuccessResponse("PDF generated successfully", data)
+		return response.NewSuccessResponse("Word document converted to PDF successfully", data)
+
+	case ".xlsx":
+		if targetFormat == "csv" {
+			data, err := ConvertExcelToCSV(file)
+			if err != nil {
+				return response.NewErrorResponse(500, fmt.Sprintf("Excel to CSV conversion failed: %s", err.Error()))
+			}
+			return response.NewSuccessResponse("Excel document converted to CSV successfully", data)
+		}
+
+	default:
+		if targetFormat == "pdf" {
+			data, err := ConvertToPDF(file, filename)
+			if err != nil {
+				return response.NewErrorResponse(500, fmt.Sprintf("PDF conversion failed: %s", err.Error()))
+			}
+			return response.NewSuccessResponse("PDF generated successfully", data)
+		}
 	}
 
-	// If the target format is unsupported, return an error
 	return response.NewErrorResponse(400, "Unsupported file format")
 }
 
-// ConvertImage converts an image file to the target format (PNG, JPEG, or WebP).
+// ConvertImage converts an image file to the target format (PNG, JPEG, or WebP)
 func ConvertImage(file io.Reader, targetFormat string) ([]byte, error) {
-	// Decode the image
 	img, _, err := image.Decode(file)
 	if err != nil {
-		// Log the error for debugging purposes
 		return nil, fmt.Errorf("failed to decode image: %w", err)
 	}
 
-	// Resize the image (optional resizing)
 	resizedImg := resize.Resize(800, 0, img, resize.Lanczos3)
 
-	// Prepare the buffer to store the converted image
 	var buf bytes.Buffer
 	switch targetFormat {
 	case "png":
@@ -69,74 +85,128 @@ func ConvertImage(file io.Reader, targetFormat string) ([]byte, error) {
 	case "jpg":
 		err = jpeg.Encode(&buf, resizedImg, nil)
 	default:
-		return nil, errors.New("unsupported image format")
+		return nil, fmt.Errorf("unsupported image format")
 	}
 
 	if err != nil {
-		// Log the error for debugging purposes
 		return nil, fmt.Errorf("failed to encode image: %w", err)
 	}
 	return buf.Bytes(), nil
 }
 
-// ConvertToPDF converts an image to a PDF document.
-func ConvertToPDF(file io.Reader) ([]byte, error) {
-	// Decode the image
-	img, _, err := image.Decode(file)
+// ConvertWordToPDF converts a Word document to a PDF document
+func ConvertWordToPDF(file io.Reader) ([]byte, error) {
+    // Create a temporary file to store the input
+    tmpInput, err := os.CreateTemp("", "input-*.docx")
+    if err != nil {
+        return nil, fmt.Errorf("failed to create temp file: %w", err)
+    }
+    defer os.Remove(tmpInput.Name())
+    
+    // Copy the input to the temporary file
+    _, err = io.Copy(tmpInput, file)
+    if err != nil {
+        return nil, fmt.Errorf("failed to copy input to temp file: %w", err)
+    }
+    tmpInput.Close()
+
+    // Initialize PDF document
+    var buf bytes.Buffer
+    pdf := gopdf.GoPdf{}
+    pdf.Start(gopdf.Config{
+        PageSize: gopdf.Rect{W: 595.28, H: 841.89}, // A4 size
+        Unit:     gopdf.Unit_PT,
+    })
+
+    // Use pandoc for conversion (requires pandoc to be installed)
+    cmd := exec.Command("pandoc", 
+        tmpInput.Name(),
+        "-f", "docx",
+        "-t", "plain",
+        "--wrap=none")
+    
+    output, err := cmd.Output()
+    if err != nil {
+        return nil, fmt.Errorf("failed to convert document: %w", err)
+    }
+
+    // Add content to PDF
+    pdf.AddPage()
+    err = pdf.AddTTFFont("default", "assets/fonts/Arial.ttf")
+    if err != nil {
+        return nil, fmt.Errorf("failed to add font: %w", err)
+    }
+
+    err = pdf.SetFont("default", "", 12)
+    if err != nil {
+        return nil, fmt.Errorf("failed to set font: %w", err)
+    }
+
+    // Split content into paragraphs and add to PDF
+    paragraphs := strings.Split(string(output), "\n\n")
+    for _, para := range paragraphs {
+        if strings.TrimSpace(para) != "" {
+            pdf.Cell(nil, para)
+            pdf.Br(20)
+        }
+    }
+
+    err = pdf.Write(&buf)
+    if err != nil {
+        return nil, fmt.Errorf("failed to write PDF: %w", err)
+    }
+
+    return buf.Bytes(), nil
+}
+
+// ConvertExcelToCSV converts an Excel document to a CSV format
+func ConvertExcelToCSV(file io.Reader) ([]byte, error) {
+	xl, err := excelize.OpenReader(file)
 	if err != nil {
-		// Log the error for debugging purposes
-		return nil, fmt.Errorf("image decode failed: %w", err)
+		return nil, fmt.Errorf("failed to read Excel document: %w", err)
 	}
 
-	// Create a temporary file to save the image
-	tmpFile, err := saveImageToTempFile(img)
-	if err != nil {
-		// Log the error for debugging purposes
-		return nil, fmt.Errorf("unable to save image to temp file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name()) // Clean up temp file
-
-	// Generate the PDF
 	var buf bytes.Buffer
-	pdf := gopdf.GoPdf{}
-	pdf.Start(gopdf.Config{PageSize: gopdf.Rect{W: 595, H: 842}}) // A4 page size
-	pdf.AddPage()
-
-	// Insert the image into the PDF
-	err = pdf.Image(tmpFile.Name(), 10, 10, nil)
-	if err != nil {
-		// Log the error for debugging purposes
-		return nil, fmt.Errorf("failed to insert image into PDF: %w", err)
-	}
-
-	// Write the PDF to a buffer
-	err = pdf.Write(&buf)
-	if err != nil {
-		// Log the error for debugging purposes
-		return nil, fmt.Errorf("failed to write PDF: %w", err)
+	for _, sheetName := range xl.GetSheetList() {
+		rows, err := xl.GetRows(sheetName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get rows: %w", err)
+		}
+		for _, row := range rows {
+			buf.WriteString(strings.Join(row, ","))
+			buf.WriteString("\n")
+		}
 	}
 
 	return buf.Bytes(), nil
 }
 
-// saveImageToTempFile saves the image to a temporary file.
-func saveImageToTempFile(img image.Image) (*os.File, error) {
-	tmpFile, err := os.CreateTemp("", "image-*.png")
+// ConvertToPDF converts an image to a PDF document
+func ConvertToPDF(file io.Reader, filename string) ([]byte, error) {
+	img, _, err := image.Decode(file)
 	if err != nil {
-		// Log the error for debugging purposes
-		return nil, err
+		return nil, fmt.Errorf("image decode failed: %w", err)
 	}
 
-	// Save the image to the temp file
-	err = png.Encode(tmpFile, img)
+	tmpFile, err := utils.SaveImageToTempFile(img, filename)
 	if err != nil {
-		tmpFile.Close()
-		// Log the error for debugging purposes
-		return nil, err
+		return nil, fmt.Errorf("unable to save image to temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	var buf bytes.Buffer
+	pdf := gopdf.GoPdf{}
+	pdf.Start(gopdf.Config{PageSize: gopdf.Rect{W: 595, H: 842}})
+	pdf.AddPage()
+	err = pdf.Image(tmpFile.Name(), 0, 0, nil)
+	if err != nil {
+		return nil, fmt.Errorf("unable to add image to PDF: %w", err)
 	}
 
-	// Rewind the file to the beginning so gopdf can read it
-	tmpFile.Seek(0, 0)
+	err = pdf.Write(&buf)
+	if err != nil {
+		return nil, fmt.Errorf("unable to write PDF: %w", err)
+	}
 
-	return tmpFile, nil
+	return buf.Bytes(), nil
 }
